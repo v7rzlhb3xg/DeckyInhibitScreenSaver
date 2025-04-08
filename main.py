@@ -1,4 +1,5 @@
 import decky_plugin
+import asyncio
 import queue
 from settings import SettingsManager
 
@@ -22,9 +23,10 @@ settings_dir = decky_plugin.DECKY_PLUGIN_SETTINGS_DIR
 settings = SettingsManager(name="settings", settings_directory=settings_dir)
 event_queue = queue.Queue()
 
-from dbus_next.aio import MessageBus
-from dbus_next import Message, MessageType
-from dbus_next.service import ServiceInterface, method, dbus_property, signal
+from dbus_next.aio import MessageBus, ProxyInterface
+from dbus_next import Message, MessageType, Variant
+from dbus_next.service import ServiceInterface, method
+
 bus = None
 
 class AppRequest:
@@ -33,7 +35,7 @@ class AppRequest:
         self.cookie = cookie
         self.application = application
         self.reason = reason
-    
+
     async def is_connected(self):
         global bus
         message = Message(
@@ -98,19 +100,66 @@ async def start_dbus():
         bus = await MessageBus().connect()
         interface = InhibitInterface()
         pm_interface = PMInhibitInterface()
-        bus.export('/ScreenSaver', interface) # vlc
-        bus.export('/org/freedesktop/ScreenSaver', interface) # chrome
-        bus.export('/org/freedesktop/PowerManagement/Inhibit', pm_interface) # wiliwili
+        bus.export('/ScreenSaver', interface)
+        bus.export('/org/freedesktop/ScreenSaver', interface)
+        bus.export('/org/freedesktop/PowerManagement/Inhibit', pm_interface)
         await bus.request_name('org.freedesktop.PowerManagement')
         await bus.request_name('org.freedesktop.ScreenSaver')
     except Exception as e:
         decky_plugin.logger.info(f"error: {e}")
+
+async def poll_mpris():
+    global bus
+    inhibit_cookie = None
+    while True:
+        try:
+            mpris_services = [n for n in (await bus.introspect('org.freedesktop.DBus', '/org/freedesktop/DBus'))
+                              .interfaces['org.freedesktop.DBus'].properties['Names'].value
+                              if n.startswith('org.mpris.MediaPlayer2.')]
+            playing = False
+            for svc in mpris_services:
+                try:
+                    player_obj = await bus.get_proxy_object(svc, '/org/mpris/MediaPlayer2', None)
+                    props = player_obj.get_interface('org.freedesktop.DBus.Properties')
+                    status = await props.call_get('org.mpris.MediaPlayer2.Player', 'PlaybackStatus')
+                    if status.value == 'Playing':
+                        playing = True
+                        break
+                except Exception:
+                    continue
+            if playing and not inhibit_cookie:
+                message = Message(
+                    destination='org.freedesktop.ScreenSaver',
+                    path='/org/freedesktop/ScreenSaver',
+                    interface='org.freedesktop.ScreenSaver',
+                    member='Inhibit',
+                    signature='ss',
+                    body=['Cider-MPRIS', 'MPRIS Playback']
+                )
+                reply = await bus.call(message)
+                if reply.message_type == MessageType.METHOD_RETURN:
+                    inhibit_cookie = reply.body[0]
+            elif not playing and inhibit_cookie:
+                message = Message(
+                    destination='org.freedesktop.ScreenSaver',
+                    path='/org/freedesktop/ScreenSaver',
+                    interface='org.freedesktop.ScreenSaver',
+                    member='UnInhibit',
+                    signature='u',
+                    body=[inhibit_cookie]
+                )
+                await bus.call(message)
+                inhibit_cookie = None
+        except Exception as e:
+            decky_plugin.logger.info(f"MPRIS poll error: {e}")
+        await asyncio.sleep(5)
 
 class Plugin:
 
     async def start_backend(self):
         decky_plugin.logger.info("Start backend server")
         await start_dbus()
+        asyncio.create_task(poll_mpris())
 
     async def stop_backend(self):
         decky_plugin.logger.info("Stop backend server")
@@ -133,7 +182,6 @@ class Plugin:
                 continue
         if len(res) > 0:
             return res
-        # check closed dbus connection
         cookies = list(BaseInterface.request_map.keys())
         clear = False
         for c in cookies:
@@ -158,7 +206,7 @@ class Plugin:
 
     async def _unload(self):
         decky_plugin.logger.info("Goodnight World!")
-        stop_dbus()
+        await stop_dbus()
 
     async def _uninstall(self):
         pass
